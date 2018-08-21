@@ -43,8 +43,9 @@ private:
 			uint32_t src_addr;
 			uint32_t len;
 			uint32_t ctrl;
+			uint32_t byte_en;
 		};
-		uint32_t u32[4];
+		uint32_t u32[8];
 	} regs;
 
 	sc_event ev_dma_copy;

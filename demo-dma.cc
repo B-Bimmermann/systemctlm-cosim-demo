@@ -40,8 +40,9 @@ demodma::demodma(sc_module_name name)
 	: sc_module(name), tgt_socket("tgt-socket")
 {
 	tgt_socket.register_b_transport(this, &demodma::b_transport);
+	memset(&regs, 0, sizeof regs);
 
-	SC_METHOD(do_dma_copy);
+	SC_THREAD(do_dma_copy);
 	dont_initialize();
 	sensitive << ev_dma_copy;
 }
@@ -60,6 +61,11 @@ void demodma::do_dma_trans(tlm::tlm_command cmd, unsigned char *buf,
 	tr.set_dmi_allowed(false);
 	tr.set_response_status(tlm::TLM_INCOMPLETE_RESPONSE);
 
+	if (regs.byte_en) {
+		tr.set_byte_enable_ptr((unsigned char *) &regs.byte_en);
+		tr.set_byte_enable_length(sizeof regs.byte_en);
+	}
+
 	init_socket->b_transport(tr, delay);
 	if (tr.get_response_status() != tlm::TLM_OK_RESPONSE) {
 		printf("%s:%d DMA transaction error!\n", __func__, __LINE__);
@@ -73,26 +79,34 @@ void demodma::update_irqs(void)
 
 void demodma::do_dma_copy(void)
 {
-	unsigned char buf[1024];
-	unsigned int len = regs.len;
+	unsigned char buf[32];
 
-	while (len > 0 && regs.ctrl & DEMODMA_CTRL_RUN) {
-		unsigned int tlen = len > sizeof buf ? sizeof buf : len;
+	while (true) {
+		if (!(regs.ctrl & DEMODMA_CTRL_RUN)) {
+			wait(ev_dma_copy);
+		}
 
-		do_dma_trans(tlm::TLM_READ_COMMAND, buf, regs.src_addr, tlen);
-		do_dma_trans(tlm::TLM_WRITE_COMMAND, buf, regs.dst_addr, tlen);
+		if (regs.len > 0 && regs.ctrl & DEMODMA_CTRL_RUN) {
+			unsigned int tlen = regs.len > sizeof buf ? sizeof buf : regs.len;
 
-		regs.dst_addr += tlen;
-		regs.src_addr += tlen;
-		len -= tlen;
+			do_dma_trans(tlm::TLM_READ_COMMAND, buf, regs.src_addr, tlen);
+			do_dma_trans(tlm::TLM_WRITE_COMMAND, buf, regs.dst_addr, tlen);
+
+			regs.dst_addr += tlen;
+			regs.src_addr += tlen;
+			regs.len -= tlen;
+		}
+
+		if (regs.len == 0 && regs.ctrl & DEMODMA_CTRL_RUN) {
+			regs.ctrl &= ~DEMODMA_CTRL_RUN;
+			/* If the DMA was running, signal done.  */
+			regs.ctrl |= DEMODMA_CTRL_DONE;
+		} else {
+			// Artificial delay between bursts.
+			wait(sc_time(1, SC_US));
+		}
+		update_irqs();
 	}
-
-	if (regs.ctrl & DEMODMA_CTRL_RUN) {
-		regs.ctrl &= ~DEMODMA_CTRL_RUN;
-		/* If the DMA was running, signal done.  */
-		regs.ctrl |= DEMODMA_CTRL_DONE;
-	}
-	update_irqs();
 }
 
 void demodma::b_transport(tlm::tlm_generic_payload& trans, sc_time& delay)
@@ -115,12 +129,16 @@ void demodma::b_transport(tlm::tlm_generic_payload& trans, sc_time& delay)
 	}
 
 	addr >>= 2;
+	addr &= 7;
 	if (trans.get_command() == tlm::TLM_READ_COMMAND) {
 		memcpy(data, &regs.u32[addr], len);
 	} else if (cmd == tlm::TLM_WRITE_COMMAND) {
+		unsigned char buf[4];
 		memcpy(&regs.u32[addr], data, len);
 		switch (addr) {
 			case 3:
+				// speculative read for testing inline path.
+				do_dma_trans(tlm::TLM_READ_COMMAND, buf, regs.src_addr, 4);
 				/* The dma copies after a usec.  */
 				ev_dma_copy.notify(delay + sc_time(1, SC_US));
 				break;
